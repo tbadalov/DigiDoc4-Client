@@ -59,7 +59,7 @@ namespace cdoc20 {
 			return true;
 		return dispatchToMain([] {
 			auto *notification = new FadeInNotification(Application::mainWindow(),
-														ria::qdigidoc4::colors::WHITE, ria::qdigidoc4::colors::MANTIS, 110);
+				ria::qdigidoc4::colors::WHITE, ria::qdigidoc4::colors::MANTIS, 110);
 			notification->start(QCoreApplication::translate("MainWindow", "Check internet connection"), 750, 3000, 1200);
 			return false;
 		});
@@ -127,7 +127,7 @@ namespace cdoc20 {
 
 		qint64 bytesAvailable() const final
 		{
-			return io->bytesAvailable() + buf.size() + QIODevice::bytesAvailable();
+			return (io->bytesAvailable() -  Crypto::Cipher::tagLen()) + buf.size() + QIODevice::bytesAvailable();
 		}
 
 		qint64 readData(char *data, qint64 maxlen) final
@@ -137,7 +137,8 @@ namespace cdoc20 {
 			std::array<char,CHUNK> in{};
 			for(int res = Z_OK; s.avail_out > 0 && res == Z_OK;)
 			{
-				if(auto size = io->read(in.data(), in.size()); size > 0)
+				if(auto insize = io->bytesAvailable() -  Crypto::Cipher::tagLen(),
+					size = io->read(in.data(), qMin<qint64>(insize, in.size())); size > 0)
 				{
 					if(!cipher->update(in.data(), int(size)))
 						return -1;
@@ -206,7 +207,7 @@ namespace cdoc20 {
 				return io->write(pad) == pad.size();
 			};
 			auto toPaxRecord = [](const QByteArray &keyword, const QByteArray &value) {
-				QByteArray record = " " + keyword + "=" + value + "\n";
+				QByteArray record = ' ' + keyword + '=' + value + '\n';
 				QByteArray result;
 				for(auto len = record.size(); result.size() != len; ++len)
 					result = QByteArray::number(len + 1) + record;
@@ -241,20 +242,23 @@ namespace cdoc20 {
 				if(auto size = copyIODevice(file.data.get(), io.get()); size < 0 || !writePadding(size))
 					return false;
 			}
-			Header eof{};
-			return io->write((const char*)&eof, Header::Size) == Header::Size;
+			return io->write((const char*)&Header::Empty, Header::Size) == Header::Size &&
+				io->write((const char*)&Header::Empty, Header::Size) == Header::Size;
 		}
 
 		std::vector<CDoc::File> files(bool &warning) const
 		{
 			std::vector<CDoc::File> result;
 			Header h {};
+			auto readHeader = [&h, this] { return io->read((char*)&h, Header::Size) == Header::Size; };
 			while(io->bytesAvailable() > 0)
 			{
-				if(io->read((char*)&h, Header::Size) != Header::Size)
+				if(!readHeader())
 					return {};
 				if(h.isNull())
 				{
+					if(!readHeader() && !h.isNull())
+						return {};
 					warning = io->bytesAvailable() > 0;
 					return result;
 				}
@@ -270,7 +274,7 @@ namespace cdoc20 {
 					if(paxData.size() != f.size)
 						return {};
 					io->skip(padding(f.size));
-					if(io->read((char*)&h, Header::Size) != Header::Size || h.isNull() || !h.verify())
+					if(!readHeader() || h.isNull() || !h.verify())
 						return {};
 					f.size = fromOctal(h.size);
 					for(const QByteArray &data: paxData.split('\n'))
@@ -338,8 +342,7 @@ namespace cdoc20 {
 			}
 
 			bool isNull() {
-				static const Header zeroBlock {};
-				return memcmp(this, &zeroBlock, sizeof(Header)) == 0;
+				return memcmp(this, &Empty, sizeof(Header)) == 0;
 			}
 
 			bool verify() {
@@ -352,6 +355,7 @@ namespace cdoc20 {
 					   referenceChecksum == checkSum.second;
 			}
 
+			static const Header Empty;
 			static const int Size;
 		};
 
@@ -386,6 +390,7 @@ namespace cdoc20 {
 		}
 	};
 
+	const TAR::Header TAR::Header::Empty {};
 	const int TAR::Header::Size = int(sizeof(TAR::Header));
 }
 
@@ -528,6 +533,11 @@ bool CDoc2::decryptPayload(const QByteArray &fmk)
 	files = cdoc20::TAR(std::unique_ptr<QIODevice>(new cdoc20::stream(this, &dec))).files(warning);
 	if(warning)
 		setLastError(tr("CDoc contains additional payload data that is not part of content"));
+	QByteArray tag = read(16);
+#ifndef NDEBUG
+	qDebug() << "tag" << tag.toHex();
+#endif
+	dec.setTag(tag);
 	if(!dec.result())
 		files.clear();
 	return !files.empty();
@@ -688,12 +698,16 @@ bool CDoc2::save(const QString &path)
 		file.remove();
 		return false;
 	}
-	file.write(enc.resultTAG());
 	if(!enc.result())
 	{
 		file.remove();
 		return false;
 	}
+	QByteArray tag = enc.tag();
+#ifndef NDEBUG
+	qDebug() << "tag" << tag.toHex();
+#endif
+	file.write(tag);
 	return true;
 }
 
